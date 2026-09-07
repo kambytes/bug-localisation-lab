@@ -151,7 +151,7 @@ CMD ["bash", "-l"]
 # =============================================================================
 # Usage
 # =============================================================================
-# From this directory ("VS Code/Docker"):
+# From this directory ("vscode/Docker"):
 #
 #   # 1. Base image (build once, reuse for every commit)
 #   docker build -f DockerfileBase -t vscode-bugloc:base .
