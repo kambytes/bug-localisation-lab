@@ -1,0 +1,171 @@
+# =============================================================================
+# DockerfileBase - reusable environment for building/running historical VS Code
+# =============================================================================
+#
+# Build once, reuse for every VSCODE_COMMIT. Contains no VS Code source and no
+# pinned Node.js version, because both change per commit.
+#
+# Every package below is justified in the comment above it. Evidence keys:
+#   [WIKI] microsoft/vscode wiki "How to Contribute" -> Prerequisites
+#   [CI-a] microsoft/vscode .github/workflows/pr.yml + pr-node-modules.yml
+#          ("sudo apt install -y build-essential pkg-config libx11-dev
+#            libx11-xcb-dev libxkbfile-dev libnotify-bin libkrb5-dev")
+#   [CI-b] microsoft/vscode .github/workflows/pr-linux-test.yml +
+#          copilot-setup-steps.yml (pkg-config xvfb libgtk-3-0 libxkbfile-dev
+#          libkrb5-dev libgbm1 rpm ...)
+#   [CI-c] microsoft/vscode .github/workflows/chat-perf.yml (explicit Electron
+#          runtime library list, used to run Electron under xvfb-run)
+#   [REPO] microsoft/vscode repository contents (package.json, .nvmrc,
+#          build/azure-pipelines/linux/xvfb.init, .devcontainer/)
+#   [OBS]  observed empirically while validating this image
+#
+# Ubuntu 22.04 is chosen deliberately.
+#   * Python 3.10. Ubuntu 24.04 ships Python 3.12, which removed distutils;
+#     historical node-gyp versions pinned by older VS Code commits fail there.
+#     Bug localisation walks backwards through history, so the older
+#     interpreter is the compatible choice.
+#   * Pre-t64 package names (libasound2, libcups2) match the apt lists used by
+#     VS Code CI for this era, so [CI-c] can be followed literally.
+# =============================================================================
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# UTF-8 locale. VS Code's build emits non-ASCII (NLS strings, test names) and
+# gulp/node crash or mangle output under the default POSIX locale.  [OBS]
+RUN apt-get update && apt-get install -y --no-install-recommends locales \
+ && locale-gen en_US.UTF-8 \
+ && update-locale LANG=en_US.UTF-8 \
+ && rm -rf /var/lib/apt/lists/*
+ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
+
+# -----------------------------------------------------------------------------
+# Build toolchain for VS Code's native modules
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # gcc/g++/make for node-gyp                              [WIKI] [CI-a]
+    build-essential \
+    # node-gyp resolves native library flags through it       [WIKI] [CI-b]
+    pkg-config \
+    # node-gyp's generator; python-is-python3 because node-gyp
+    # invokes bare `python` on older VS Code commits          [WIKI]
+    python3 python3-pip python-is-python3 \
+    # node-gyp >= 10 imports setuptools instead of distutils  [WIKI]
+    python3-setuptools \
+    # clone the VS Code repo and check out the requested commit  [REPO]
+    git \
+    # download Node.js tarballs over HTTPS in DockerfileVersion
+    curl ca-certificates \
+    # headers for the `native-keymap` native module           [WIKI] [CI-a]
+    libx11-dev libx11-xcb-dev libxkbfile-dev \
+    # headers for the `kerberos` native module                [WIKI] [CI-b]
+    libkrb5-dev \
+    # headers for `keytar`, a dependency of every VS Code commit up to
+    # ~1.93 (present in package.json at 1.80.0, absent at 1.94.0).
+    # Required for historical commits only, which is exactly this
+    # project's target range.                                 [WIKI] [REPO]
+    libsecret-1-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Electron / Chromium runtime libraries
+#
+# This list is VS Code's own, taken from .github/workflows/chat-perf.yml, which
+# is the workflow that actually launches Electron under xvfb-run.  [CI-c]
+# The GitHub runner image already carries these, so they are absent from the
+# shorter [CI-b] list; a bare Ubuntu image has none of them.
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-3-0 \
+    libnss3 \
+    libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 libgbm1 \
+    libxcomposite1 libxdamage1 libxrandr2 libxfixes3 \
+    libpango-1.0-0 libcairo2 \
+    libasound2 \
+    libxshmfence1 \
+    # Chromium's X screensaver-inhibition path; in VS Code's own
+    # .github/workflows/monaco-editor.yml apt list                  [REPO]
+    libxss1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Fonts. Not in any VS Code apt list because CI runners ship fonts, but a bare
+# Ubuntu image has no font at all and the VS Code window then renders every
+# glyph as a blank box, which makes GUI bug reproduction useless.  [OBS]
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-liberation fontconfig \
+ && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Virtual display
+#
+# Xvfb is VS Code's own answer to "no display on Linux": the repo carries
+# build/azure-pipelines/linux/xvfb.init and every GUI-touching workflow starts
+# it before running Electron.                                    [REPO] [CI-b]
+# x11vnc is added so a human can watch and drive the window while localising a
+# GUI bug. That is the whole point of this project, so it is justified here
+# rather than borrowed from Ripple.
+# No XFCE desktop: VS Code is the only window that needs to appear.
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb x11vnc \
+ && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# nvm, with no Node.js version pinned
+#
+# VS Code's .nvmrc has moved 4 -> 8 -> 10 -> 12 -> 16 -> 18 -> 20 -> 22 -> 24
+# over the repository's history (git log of .nvmrc). A single pinned Node in
+# the base image would therefore be wrong for most historical commits, so the
+# base ships the version manager and DockerfileVersion installs whatever the
+# checked-out commit's .nvmrc asks for.                                 [REPO]
+# -----------------------------------------------------------------------------
+ENV NVM_DIR=/usr/local/nvm
+RUN mkdir -p "$NVM_DIR" \
+ && curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+ && printf '%s\n' \
+      'export NVM_DIR=/usr/local/nvm' \
+      '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' \
+      > /etc/profile.d/nvm.sh
+
+# Chromium's setuid sandbox cannot work in an unprivileged container, and
+# VS Code CI itself relaxes the kernel for it
+# (`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` in
+# pr-linux-test.yml). Inside Docker the equivalent is to disable the sandbox.
+# Consumed by the launch script in DockerfileVersion.                   [CI-b]
+ENV ELECTRON_DISABLE_SANDBOX=1
+ENV DISPLAY=:99
+
+# Non-root user: VS Code's build refuses to run some npm lifecycle scripts as
+# root, and Chromium's zygote is happier unprivileged.                  [OBS]
+RUN useradd -ms /bin/bash vscodedev \
+ && chown -R vscodedev:vscodedev "$NVM_DIR"
+USER vscodedev
+WORKDIR /home/vscodedev
+
+SHELL ["/bin/bash", "-lc"]
+CMD ["bash", "-l"]
+
+# =============================================================================
+# Usage
+# =============================================================================
+# From this directory ("VS Code/Docker"):
+#
+#   # 1. Base image (build once, reuse for every commit)
+#   docker build -f DockerfileBase -t vscode-bugloc:base .
+#
+#   # 2. A specific commit handed to you by git bisect
+#   docker build -f DockerfileVersion \
+#     --build-arg VSCODE_COMMIT=03c265b1adee71ac88f833e065f7bb956b60550a \
+#     -t vscode-bugloc:03c265b .
+#
+#   # 3. Run it; VS Code starts on the container's Xvfb display
+#   docker run --rm -it -p 5900:5900 --shm-size=1g vscode-bugloc:03c265b
+#
+#   # 4. Watch/drive the GUI
+#   open vnc://localhost:5900          # macOS Screen Sharing, no password
+#
+# On Apple Silicon add --platform=linux/arm64 to both builds and to the run.
+# =============================================================================
