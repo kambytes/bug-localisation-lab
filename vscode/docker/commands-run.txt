@@ -1,0 +1,12 @@
+1. From root of bug-localisation-lab/
+docker build \
+  -f "VS Code/Docker/DockerfileBase" \
+  -t vscode-bugloc:base \
+  .
+
+2. Identify the commit_id you want to run. Substitute the argument: VSCODE_COMMIT=<YOUR_COMMIT_SHA
+docker build \
+  -f "VS Code/Docker/DockerfileVersion" \
+  --build-arg VSCODE_COMMIT=<YOUR_COMMIT_SHA> \
+  -t vscode-bugloc:<SHORT_SHA> \
+  .
