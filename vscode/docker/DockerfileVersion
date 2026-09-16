@@ -4,16 +4,16 @@
 #
 #   docker build -f DockerfileVersion \
 #     --build-arg VSCODE_COMMIT=<sha> \
-#     -t vscode-bugloc:<sha-short> .
+#     -t vscode-bugloc:<short-sha> .
 #
 # VSCODE_COMMIT is the only build argument. It is the commit that git bisect
 # (or VS Code's own bisect) handed you.
 #
 # The source is cloned inside the build rather than copied from
-# "vscode/source/vscode". That keeps the build context empty and the result
+# vscode/source/vscode. That keeps the build context empty and makes the image
 # reproducible from a SHA alone, which matters more here than clone time. The
-# local clone next door is still the useful place to *run* git bisect and to
-# read history; it just is not the build input.
+# local clone next door is still the right place to run git bisect and read
+# history; it just is not the build input.
 # =============================================================================
 
 FROM vscode-bugloc:base
@@ -30,16 +30,15 @@ WORKDIR /home/vscodedev
 # -----------------------------------------------------------------------------
 # 1-3. Obtain the source and check out exactly VSCODE_COMMIT
 #
-# Fetching the single commit by SHA (GitHub allows this) avoids pulling the
-# whole ~2 GB history. Falls back to a full clone if the SHA is not directly
-# fetchable, e.g. a commit only reachable from a fork or an unadvertised ref.
+# Fetching the single commit by SHA (GitHub allows this) avoids pulling ~2 GB
+# of history. Falls back to a full fetch if the SHA is not directly fetchable.
 # -----------------------------------------------------------------------------
 RUN test -n "$VSCODE_COMMIT" || { echo "ERROR: --build-arg VSCODE_COMMIT=<sha> is required"; exit 1; } \
  && mkdir -p "$VSCODE_DIR" && cd "$VSCODE_DIR" \
  && git init -q . \
  && git remote add origin https://github.com/microsoft/vscode.git \
  && ( git fetch --depth 1 origin "$VSCODE_COMMIT" \
-      || { echo "Shallow fetch by SHA failed, falling back to full clone"; \
+      || { echo "Shallow fetch by SHA failed, falling back to a full fetch"; \
            git fetch origin; } ) \
  && git checkout -q --detach "$VSCODE_COMMIT" \
  && echo "Checked out: $(git rev-parse HEAD)"
@@ -47,13 +46,12 @@ RUN test -n "$VSCODE_COMMIT" || { echo "ERROR: --build-arg VSCODE_COMMIT=<sha> i
 WORKDIR ${VSCODE_DIR}
 
 # -----------------------------------------------------------------------------
-# 4a. Node.js version required *by this commit*
+# 4a. The Node.js version required BY THIS COMMIT
 #
-# .nvmrc has moved 4 -> 8 -> 10 -> 12 -> 16 -> 18 -> 20 -> 22 -> 24 across VS
-# Code's history, so the version is read from the checked-out tree rather than
-# baked into the base image. Commits older than the introduction of .nvmrc
-# (pre-2016) fall back to Node 16, the oldest version nvm can still fetch
-# reliably.
+# Read from the checked-out tree rather than baked into the base image, because
+# .nvmrc moves across VS Code's history (4 -> ... -> 24). Commits predating
+# .nvmrc (pre-2016) fall back to Node 16, the oldest version nvm still fetches
+# reliably against a modern glibc.
 # -----------------------------------------------------------------------------
 RUN NODE_VERSION="$(cat .nvmrc 2>/dev/null | tr -d '[:space:]')" \
  && NODE_VERSION="${NODE_VERSION:-16}" \
@@ -63,17 +61,15 @@ RUN NODE_VERSION="$(cat .nvmrc 2>/dev/null | tr -d '[:space:]')" \
  && node --version && npm --version
 
 # -----------------------------------------------------------------------------
-# 4b. Dependencies, using the package manager *this commit* expects
+# 4b. Dependencies, using the package manager THIS COMMIT expects
 #
 # microsoft/vscode switched from yarn to npm in commit b5a6aa14a8c5
-# ("feat: switch to npm as default package manager", 2024-09-06), which
-# deleted yarn.lock/.yarnrc and added package-lock.json in one change.
-# Detecting the lockfile therefore covers the whole history with two branches
-# and no version table.
-#
-# `npm run electron` afterwards mirrors .devcontainer/post-create.sh
-# ("npm i && npm run electron") and guarantees the Electron binary is present
-# in .build/electron even when the install lifecycle did not fetch it.
+# ("feat: switch to npm as default package manager", #226927, 2024-09-06),
+# which deleted yarn.lock and added package-lock.json in the same change
+# (verified: `git log --diff-filter=D -- yarn.lock` and
+#            `git log --diff-filter=A -- package-lock.json` both name it).
+# Detecting the lockfile therefore covers the entire history in two branches,
+# with no version table to maintain.
 # -----------------------------------------------------------------------------
 RUN if [ -f package-lock.json ]; then \
       echo "npm era (package-lock.json present)"; \
@@ -87,16 +83,23 @@ RUN if [ -f package-lock.json ]; then \
       npm install; \
     fi
 
-RUN npm run electron
+# Ensure the Electron binary is present in .build/electron. This mirrors
+# .devcontainer/post-create.sh ("npm i && npm run electron"). The script is
+# guarded because very old commits predate it.
+RUN if node -e "process.exit(require('./package.json').scripts.electron?0:1)"; then \
+      npm run electron; \
+    else \
+      echo "No 'electron' script at this commit; relying on the install lifecycle"; \
+    fi
 
 # -----------------------------------------------------------------------------
 # 5. Build
 #
 # `compile` produces the runnable development build that ./scripts/code.sh
-# launches. This is deliberately not a packaged .deb/.rpm build: VS Code's
-# release pipeline (build/azure-pipelines/linux/setup-env.sh) downloads
-# Chromium sysroots and a pinned clang to produce distributable binaries, and
-# none of that is needed to reproduce a bug.
+# launches. Deliberately NOT a packaged .deb/.rpm build: VS Code's release
+# pipeline (build/azure-pipelines/linux/setup-env.sh) downloads Chromium
+# sysroots and a pinned clang to produce distributable binaries, and none of
+# that is needed to reproduce a bug.
 # -----------------------------------------------------------------------------
 RUN npm run compile
 
@@ -104,14 +107,14 @@ RUN npm run compile
 # 6. Launchable environment
 #
 # Starts Xvfb (VS Code's own choice of virtual display: see
-# build/azure-pipelines/linux/xvfb.init in the repo) plus x11vnc so the window
-# can be watched and driven on port 5900, then runs VS Code.
+# build/azure-pipelines/linux/xvfb.init) plus x11vnc so the window can be
+# watched and driven on port 5900, then runs VS Code.
 #
-# --no-sandbox: Chromium's setuid/namespace sandbox does not work in an
-# unprivileged container. VS Code CI relaxes the host kernel instead
-# (kernel.apparmor_restrict_unprivileged_userns=0 in pr-linux-test.yml);
-# disabling the sandbox is the container-side equivalent.
-# --disable-gpu / SwiftShader: no GPU is exposed to the container.
+# --no-sandbox          Chromium's sandbox does not work unprivileged in a
+#                       container; VS Code CI relaxes the host kernel instead.
+# --disable-gpu         no GPU is exposed to the container.
+# --disable-dev-shm-usage  /dev/shm defaults to 64 MB in Docker; without this
+#                       (or --shm-size=1g on run) the renderer crashes.
 # -----------------------------------------------------------------------------
 RUN printf '%s\n' \
   '#!/bin/bash' \

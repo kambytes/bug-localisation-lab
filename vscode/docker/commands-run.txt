@@ -1,12 +1,36 @@
-1. From root of bug-localisation-lab/
-docker build \
-  -f "VS Code/Docker/DockerfileBase" \
-  -t vscode-bugloc:base \
-  .
+Run all commands from the repository root (bug-localisation-lab/).
 
-2. Identify the commit_id you want to run. Substitute the argument: VSCODE_COMMIT=<YOUR_COMMIT_SHA
-docker build \
-  -f "VS Code/Docker/DockerfileVersion" \
-  --build-arg VSCODE_COMMIT=<YOUR_COMMIT_SHA> \
-  -t vscode-bugloc:<SHORT_SHA> \
-  .
+1. Build the base image ONCE. Reuse it for every commit.
+
+   docker build \
+     -f vscode/docker/DockerfileBase \
+     -t vscode-bugloc:base \
+     vscode/docker
+
+2. Build a specific VS Code commit (the SHA git bisect gave you).
+   Example uses the 1.96.0 release commit.
+
+   docker build \
+     -f vscode/docker/DockerfileVersion \
+     --build-arg VSCODE_COMMIT=138f619c86f1199955d53b4166bef66ef252935c \
+     -t vscode-bugloc:138f619 \
+     vscode/docker
+
+3. Run the container. It starts Xvfb + x11vnc and launches VS Code.
+
+   docker run --rm -it -p 5900:5900 --shm-size=1g vscode-bugloc:138f619
+
+4. Watch and drive the GUI (macOS Screen Sharing, no password):
+
+   open vnc://localhost:5900
+
+Useful variations
+-----------------
+Shell instead of launching VS Code:
+   docker run --rm -it -p 5900:5900 --shm-size=1g vscode-bugloc:138f619 bash -l
+
+Which commit is this image?
+   docker run --rm vscode-bugloc:138f619 cat /home/vscodedev/VSCODE_COMMIT
+
+Apple Silicon: add --platform=linux/amd64 to BOTH builds and the run if an
+arm64 build fails (see the limitations note in DockerfileBase).

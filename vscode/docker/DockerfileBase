@@ -1,39 +1,46 @@
 # =============================================================================
-# DockerfileBase - reusable environment for building/running historical VS Code
+# DockerfileBase - reusable environment for building and running historical
+#                  Microsoft VS Code commits during bug localisation.
 # =============================================================================
 #
-# Build once, reuse for every VSCODE_COMMIT. Contains no VS Code source and no
-# pinned Node.js version, because both change per commit.
+# Build once; reuse for every VSCODE_COMMIT. Contains no VS Code source and no
+# pinned Node.js version, because both change from commit to commit.
 #
-# Every package below is justified in the comment above it. Evidence keys:
-#   [WIKI] microsoft/vscode wiki "How to Contribute" -> Prerequisites
-#   [CI-a] microsoft/vscode .github/workflows/pr.yml + pr-node-modules.yml
-#          ("sudo apt install -y build-essential pkg-config libx11-dev
-#            libx11-xcb-dev libxkbfile-dev libnotify-bin libkrb5-dev")
-#   [CI-b] microsoft/vscode .github/workflows/pr-linux-test.yml +
-#          copilot-setup-steps.yml (pkg-config xvfb libgtk-3-0 libxkbfile-dev
-#          libkrb5-dev libgbm1 rpm ...)
-#   [CI-c] microsoft/vscode .github/workflows/chat-perf.yml (explicit Electron
-#          runtime library list, used to run Electron under xvfb-run)
-#   [REPO] microsoft/vscode repository contents (package.json, .nvmrc,
-#          build/azure-pipelines/linux/xvfb.init, .devcontainer/)
-#   [OBS]  observed empirically while validating this image
+# Evidence keys used below:
+#   [DEPS]  microsoft/vscode build/linux/debian/dep-lists.ts -
+#           `referenceGeneratedDepsByArch` + `additionalDeps`. This is VS Code's
+#           own declared RUNTIME dependency list, the one baked into the .deb it
+#           ships. It is the strongest available evidence for "what does the
+#           VS Code GUI need in order to start".
+#   [CI-b]  .github/workflows/pr.yml, pr-node-modules.yml, sessions-e2e.yml and
+#           build/azure-pipelines/dependencies-check.yml, which all install:
+#             build-essential pkg-config libx11-dev libx11-xcb-dev
+#             libxkbfile-dev libnotify-bin libkrb5-dev
+#           This is VS Code's own BUILD dependency list.
+#   [CI-t]  .github/workflows/pr-linux-test.yml, copilot-setup-steps.yml:
+#             pkg-config xvfb libgtk-3-0 libxkbfile-dev libkrb5-dev libgbm1
+#             rpm bubblewrap socat
+#   [CI-g]  .github/workflows/chat-perf.yml - the workflow that actually
+#           launches Electron headlessly; adds libdrm2, libxshmfence1.
+#   [REPO]  repository contents: package.json at specific tags, .nvmrc history,
+#           build/azure-pipelines/linux/xvfb.init
+#   [ASSUM] this project's own assumption / judgement call, NOT evidence.
 #
-# Ubuntu 22.04 is chosen deliberately.
-#   * Python 3.10. Ubuntu 24.04 ships Python 3.12, which removed distutils;
-#     historical node-gyp versions pinned by older VS Code commits fail there.
-#     Bug localisation walks backwards through history, so the older
-#     interpreter is the compatible choice.
-#   * Pre-t64 package names (libasound2, libcups2) match the apt lists used by
-#     VS Code CI for this era, so [CI-c] can be followed literally.
+# Ubuntu 22.04 (jammy) is chosen deliberately:
+#   * Python 3.10, which still ships distutils. Ubuntu 24.04 has Python 3.12,
+#     where distutils was removed; the older node-gyp versions pinned by
+#     historical VS Code commits import it. Bug localisation walks backwards
+#     through history, so the older interpreter is the safer choice. [ASSUM]
+#   * Pre-t64 library names (libasound2, libcups2), matching the ABI era of the
+#     Electron builds used by the VS Code versions in scope. [ASSUM]
 # =============================================================================
 
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# UTF-8 locale. VS Code's build emits non-ASCII (NLS strings, test names) and
-# gulp/node crash or mangle output under the default POSIX locale.  [OBS]
+# UTF-8 locale. VS Code's build emits non-ASCII (NLS strings, gulp output) and
+# is not reliable under the default POSIX locale. [ASSUM]
 RUN apt-get update && apt-get install -y --no-install-recommends locales \
  && locale-gen en_US.UTF-8 \
  && update-locale LANG=en_US.UTF-8 \
@@ -41,86 +48,115 @@ RUN apt-get update && apt-get install -y --no-install-recommends locales \
 ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
 
 # -----------------------------------------------------------------------------
-# Build toolchain for VS Code's native modules
+# 1. Build toolchain
+#
+# VS Code compiles native addons from source on Linux: native-keymap, kerberos,
+# node-pty, @vscode/spdlog, @vscode/policy-watcher, @parcel/watcher and - on
+# commits older than ~1.84 - keytar. Every package here serves one of those.
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # gcc/g++/make for node-gyp                              [WIKI] [CI-a]
+    # gcc / g++ / make, used by node-gyp for every native addon        [CI-b]
     build-essential \
-    # node-gyp resolves native library flags through it       [WIKI] [CI-b]
+    # node-gyp resolves native library flags through it                [CI-b]
     pkg-config \
-    # node-gyp's generator; python-is-python3 because node-gyp
-    # invokes bare `python` on older VS Code commits          [WIKI]
-    python3 python3-pip python-is-python3 \
-    # node-gyp >= 10 imports setuptools instead of distutils  [WIKI]
+    # node-gyp's generator is a Python script. python-is-python3 because
+    # node-gyp on older commits invokes a bare `python`.               [ASSUM]
+    python3 python-is-python3 \
+    # node-gyp >= 10 imports setuptools where older versions used
+    # distutils; installing both keeps either path working.            [ASSUM]
     python3-setuptools \
-    # clone the VS Code repo and check out the requested commit  [REPO]
+    # clone VS Code and check out the requested commit                 [REPO]
     git \
-    # download Node.js tarballs over HTTPS in DockerfileVersion
+    # fetch the Node.js tarball in DockerfileVersion
     curl ca-certificates \
-    # headers for the `native-keymap` native module           [WIKI] [CI-a]
+    # headers for `native-keymap`                                      [CI-b]
     libx11-dev libx11-xcb-dev libxkbfile-dev \
-    # headers for the `kerberos` native module                [WIKI] [CI-b]
+    # headers for `kerberos`                                           [CI-b]
     libkrb5-dev \
-    # headers for `keytar`, a dependency of every VS Code commit up to
-    # ~1.93 (present in package.json at 1.80.0, absent at 1.94.0).
-    # Required for historical commits only, which is exactly this
-    # project's target range.                                 [WIKI] [REPO]
+    # headers for `keytar`. Verified present in package.json at tags
+    # 1.50.0 / 1.60.0 / 1.70.0 / 1.75.0 / 1.80.0 and absent by 1.85.0,
+    # so this is needed only for the older half of the history - which
+    # is exactly where a bug-localisation bisect ends up.              [REPO]
     libsecret-1-dev \
  && rm -rf /var/lib/apt/lists/*
+#
+# Deliberately NOT installed, despite appearing in VS Code's own apt lists:
+#   libnotify-bin        appears in [CI-b], but grepping the repository finds
+#                        no reference to notify-send or libnotify in any build
+#                        script or package.json. Unjustified here.
+#   rpm, fakeroot        only needed to produce distributable .deb/.rpm
+#                        packages (build/azure-pipelines). Bug reproduction
+#                        runs the development build, not an installer.
+#   bubblewrap, socat    [CI-t]/[DEPS] list them for agent command sandboxing;
+#                        they are Recommends, not Depends, and are not needed
+#                        to start the editor.
+#   sqlite3, jq, unzip,
+#   imagemagick, xdotool  Ripple installs these for its own tooling. Nothing in
+#                        VS Code's build or launch path uses them.
 
 # -----------------------------------------------------------------------------
-# Electron / Chromium runtime libraries
+# 2. Electron / Chromium runtime libraries
 #
-# This list is VS Code's own, taken from .github/workflows/chat-perf.yml, which
-# is the workflow that actually launches Electron under xvfb-run.  [CI-c]
-# The GitHub runner image already carries these, so they are absent from the
-# shorter [CI-b] list; a bare Ubuntu image has none of them.
+# This list is VS Code's own declared runtime dependency set from
+# build/linux/debian/dep-lists.ts [DEPS]. Entries that arrive transitively on
+# Ubuntu (libglib2.0-0, libexpat1, libdbus-1-3, libx11-6, libxcb1, libxext6,
+# libudev1, libnspr4, libatspi2.0-0) are not repeated; they come in as Depends
+# of the packages below even under --no-install-recommends.
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 \
     libnss3 \
-    libatk1.0-0 libatk-bridge2.0-0 \
+    libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
     libcups2 \
-    libdrm2 libgbm1 \
-    libxcomposite1 libxdamage1 libxrandr2 libxfixes3 \
+    libgbm1 \
+    libxcomposite1 libxdamage1 libxrandr2 libxfixes3 libxext6 \
+    libxkbcommon0 libxkbfile1 \
     libpango-1.0-0 libcairo2 \
     libasound2 \
-    libxshmfence1 \
-    # Chromium's X screensaver-inhibition path; in VS Code's own
-    # .github/workflows/monaco-editor.yml apt list                  [REPO]
+    # listed in [DEPS] additionalDeps for Breakpad crash reporting
+    libcurl4 \
+    # listed in [DEPS] additionalDeps for OS integration (xdg-open etc.)
+    xdg-utils \
+    # not in [DEPS]; in [CI-g], the workflow that actually launches Electron
+    libdrm2 libxshmfence1 \
+    # not in [DEPS]; in .github/workflows/monaco-editor.yml. Chromium's X
+    # screensaver-inhibition path.                                     [REPO]
     libxss1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Fonts. Not in any VS Code apt list because CI runners ship fonts, but a bare
-# Ubuntu image has no font at all and the VS Code window then renders every
-# glyph as a blank box, which makes GUI bug reproduction useless.  [OBS]
+# Fonts. Not in any VS Code list, because CI runners and real desktops already
+# have fonts, but a bare Ubuntu image has none and VS Code then renders every
+# glyph as a blank box - which makes GUI bug reproduction useless. [ASSUM]
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation fontconfig \
  && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# Virtual display
+# 3. Virtual display
 #
-# Xvfb is VS Code's own answer to "no display on Linux": the repo carries
+# Xvfb is VS Code's own answer to "no display on Linux": the repository carries
 # build/azure-pipelines/linux/xvfb.init and every GUI-touching workflow starts
-# it before running Electron.                                    [REPO] [CI-b]
-# x11vnc is added so a human can watch and drive the window while localising a
-# GUI bug. That is the whole point of this project, so it is justified here
-# rather than borrowed from Ripple.
-# No XFCE desktop: VS Code is the only window that needs to appear.
+# it before running Electron.                                   [REPO] [CI-t]
+# x11vnc is added on top so a human can watch and drive the window while
+# localising a GUI bug. That is this project's whole purpose, so it is
+# justified on its own terms rather than borrowed from Ripple.        [ASSUM]
+# No XFCE desktop: VS Code is the only window that needs to exist, and a full
+# desktop session is the largest single thing Ripple installs.
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11vnc \
  && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# nvm, with no Node.js version pinned
+# 4. nvm, with no Node.js version pinned
 #
-# VS Code's .nvmrc has moved 4 -> 8 -> 10 -> 12 -> 16 -> 18 -> 20 -> 22 -> 24
-# over the repository's history (git log of .nvmrc). A single pinned Node in
-# the base image would therefore be wrong for most historical commits, so the
-# base ships the version manager and DockerfileVersion installs whatever the
-# checked-out commit's .nvmrc asks for.                                 [REPO]
+# .nvmrc in microsoft/vscode has moved 4 -> 8 -> 8.9.2 -> 10 -> 12 -> 16.14 ->
+# 16.17 -> 18.15 -> 18.17 -> 18.17.1 -> 18.19.0 -> 20.x -> 22.x -> 24.x across
+# the repository's history (verified with `git log -p -- .nvmrc`). Spot checks:
+# 1.85.0 -> 18.17.1, 1.96.0 -> 20.18.0, 1.100.0 -> 20.19.0.
+# Pinning one Node version in the base image would therefore be wrong for most
+# historical commits. The base ships the version manager; DockerfileVersion
+# installs whatever the checked-out commit asks for.                    [REPO]
 # -----------------------------------------------------------------------------
 ENV NVM_DIR=/usr/local/nvm
 RUN mkdir -p "$NVM_DIR" \
@@ -130,16 +166,15 @@ RUN mkdir -p "$NVM_DIR" \
       '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' \
       > /etc/profile.d/nvm.sh
 
-# Chromium's setuid sandbox cannot work in an unprivileged container, and
-# VS Code CI itself relaxes the kernel for it
-# (`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` in
-# pr-linux-test.yml). Inside Docker the equivalent is to disable the sandbox.
-# Consumed by the launch script in DockerfileVersion.                   [CI-b]
+# Chromium's setuid/namespace sandbox cannot work in an unprivileged container.
+# VS Code CI relaxes the host kernel instead
+# (`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, pr-linux-test.yml);
+# inside Docker the equivalent is to disable the sandbox.              [CI-t]
 ENV ELECTRON_DISABLE_SANDBOX=1
 ENV DISPLAY=:99
 
-# Non-root user: VS Code's build refuses to run some npm lifecycle scripts as
-# root, and Chromium's zygote is happier unprivileged.                  [OBS]
+# Non-root user: npm refuses to run some lifecycle scripts as root, and
+# Chromium's zygote is happier unprivileged.                          [ASSUM]
 RUN useradd -ms /bin/bash vscodedev \
  && chown -R vscodedev:vscodedev "$NVM_DIR"
 USER vscodedev
@@ -147,25 +182,3 @@ WORKDIR /home/vscodedev
 
 SHELL ["/bin/bash", "-lc"]
 CMD ["bash", "-l"]
-
-# =============================================================================
-# Usage
-# =============================================================================
-# From this directory ("vscode/Docker"):
-#
-#   # 1. Base image (build once, reuse for every commit)
-#   docker build -f DockerfileBase -t vscode-bugloc:base .
-#
-#   # 2. A specific commit handed to you by git bisect
-#   docker build -f DockerfileVersion \
-#     --build-arg VSCODE_COMMIT=03c265b1adee71ac88f833e065f7bb956b60550a \
-#     -t vscode-bugloc:03c265b .
-#
-#   # 3. Run it; VS Code starts on the container's Xvfb display
-#   docker run --rm -it -p 5900:5900 --shm-size=1g vscode-bugloc:03c265b
-#
-#   # 4. Watch/drive the GUI
-#   open vnc://localhost:5900          # macOS Screen Sharing, no password
-#
-# On Apple Silicon add --platform=linux/arm64 to both builds and to the run.
-# =============================================================================
