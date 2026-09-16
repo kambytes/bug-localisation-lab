@@ -166,6 +166,29 @@ RUN mkdir -p "$NVM_DIR" \
       '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' \
       > /etc/profile.d/nvm.sh
 
+# -----------------------------------------------------------------------------
+# V8 heap size for the build
+#
+# `npm run compile` compiles all of src/ in a single Node process. Node derives
+# its default old-space heap from the memory it can see, so in a container it
+# self-caps near 2 GB and the compile dies with
+#   FATAL ERROR: Reached heap limit Allocation failed (exit 134)
+# On a dev machine or a CI runner this never appears, which is why gulp does
+# not set it.
+#
+# 8192 is VS Code's own figure: package.json runs its heavy Node build steps as
+# `node --max-old-space-size=8192` (the `eslint` and
+# `define-class-fields-check` scripts).                                  [REPO]
+#
+# Requires the Docker VM to actually have that much memory. On Docker Desktop:
+# Settings > Resources > Memory >= 8 GB, or the build is OOM-killed (exit 137).
+#
+# The launch script in DockerfileVersion unsets this before starting Electron,
+# mirroring resources/darwin/bin/code.sh, which also unsets NODE_OPTIONS
+# before launching the app.                                              [REPO]
+# -----------------------------------------------------------------------------
+ENV NODE_OPTIONS=--max-old-space-size=8192
+
 # Chromium's setuid/namespace sandbox cannot work in an unprivileged container.
 # VS Code CI relaxes the host kernel instead
 # (`sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, pr-linux-test.yml);

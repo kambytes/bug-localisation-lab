@@ -120,6 +120,9 @@ RUN printf '%s\n' \
   '#!/bin/bash' \
   'set -e' \
   'source /etc/profile.d/nvm.sh' \
+  '# NODE_OPTIONS raises the heap for the BUILD; Electron must not inherit it,' \
+  '# mirroring resources/darwin/bin/code.sh.' \
+  'unset NODE_OPTIONS' \
   'DISPLAY_NUM="${DISPLAY:-:99}"' \
   'Xvfb "$DISPLAY_NUM" -screen 0 1280x900x24 -ac >/tmp/xvfb.log 2>&1 &' \
   'sleep 2' \
