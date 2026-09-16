@@ -1,143 +1,99 @@
 # =============================================================================
-# DockerfileVersion - build one specific VS Code commit on top of the base
+# DockerfileVersion - built ONCE PER COMMIT during a bisect.
+#
+#   docker build -f vscode/docker/DockerfileVersion \
+#     --build-arg COMMIT=<sha> \
+#     -t vscode:<short-sha> vscode/docker
+#
+# Normally driven by bisect-step.sh rather than run by hand.
+#
+# COMMIT is the only input - the single commit git bisect handed you.
+#
+# This image inherits the clone, node_modules and .build/ from vscode:base, so
+# it does not clone and does not reinstall from scratch. That is what keeps a
+# bisect step to minutes instead of tens of minutes, and what keeps each image
+# to ~2 GB of new layers instead of another ~8 GB.
 # =============================================================================
-#
-#   docker build -f DockerfileVersion \
-#     --build-arg VSCODE_COMMIT=<sha> \
-#     -t vscode-bugloc:<short-sha> .
-#
-# VSCODE_COMMIT is the only build argument. It is the commit that git bisect
-# (or VS Code's own bisect) handed you.
-#
-# The source is cloned inside the build rather than copied from
-# vscode/source/vscode. That keeps the build context empty and makes the image
-# reproducible from a SHA alone, which matters more here than clone time. The
-# local clone next door is still the right place to run git bisect and read
-# history; it just is not the build input.
-# =============================================================================
 
-FROM vscode-bugloc:base
+FROM vscode:base
 
-ARG VSCODE_COMMIT
+ARG COMMIT
 
-# Login shell so /etc/profile.d/nvm.sh is sourced in every RUN.
+# Login shell so nvm is available in every RUN.
 SHELL ["/bin/bash", "-lc"]
-
 USER vscodedev
-ENV VSCODE_DIR=/home/vscodedev/vscode
-WORKDIR /home/vscodedev
+WORKDIR /home/vscodedev/vscode
 
-# -----------------------------------------------------------------------------
-# 1-3. Obtain the source and check out exactly VSCODE_COMMIT
-#
-# Fetching the single commit by SHA (GitHub allows this) avoids pulling ~2 GB
-# of history. Falls back to a full fetch if the SHA is not directly fetchable.
-# -----------------------------------------------------------------------------
-RUN test -n "$VSCODE_COMMIT" || { echo "ERROR: --build-arg VSCODE_COMMIT=<sha> is required"; exit 1; } \
- && mkdir -p "$VSCODE_DIR" && cd "$VSCODE_DIR" \
- && git init -q . \
- && git remote add origin https://github.com/microsoft/vscode.git \
- && ( git fetch --depth 1 origin "$VSCODE_COMMIT" \
-      || { echo "Shallow fetch by SHA failed, falling back to a full fetch"; \
-           git fetch origin; } ) \
- && git checkout -q --detach "$VSCODE_COMMIT" \
- && echo "Checked out: $(git rev-parse HEAD)"
+# --- 1. Check out the commit under test ---------------------------------------
+# The blobless clone in the base already carries the whole commit graph, so a
+# fetch is normally unnecessary - only reach for the network if the SHA is
+# genuinely unknown (a commit pushed since the base was built).
+RUN test -n "$COMMIT" || { echo "ERROR: --build-arg COMMIT=<sha> is required"; exit 1; } \
+ && if ! git cat-file -e "${COMMIT}^{commit}" 2>/dev/null; then \
+      echo "Commit not in the base clone, fetching"; \
+      git fetch -q origin "$COMMIT" 2>/dev/null || git fetch -q origin; \
+    fi \
+ && git checkout -q --detach "$COMMIT" \
+ && echo "Testing commit: $(git rev-parse HEAD)"
 
-WORKDIR ${VSCODE_DIR}
-
-# -----------------------------------------------------------------------------
-# 4a. The Node.js version required BY THIS COMMIT
-#
-# Read from the checked-out tree rather than baked into the base image, because
-# .nvmrc moves across VS Code's history (4 -> ... -> 24). Commits predating
-# .nvmrc (pre-2016) fall back to Node 16, the oldest version nvm still fetches
-# reliably against a modern glibc.
-# -----------------------------------------------------------------------------
-RUN NODE_VERSION="$(cat .nvmrc 2>/dev/null | tr -d '[:space:]')" \
- && NODE_VERSION="${NODE_VERSION:-16}" \
- && echo "Commit requires Node.js ${NODE_VERSION}" \
+# --- 2. Node version for THIS commit ------------------------------------------
+# Usually identical to the base's, in which case nvm install is a no-op.
+RUN NODE_VERSION="$(tr -d '[:space:]' < .nvmrc 2>/dev/null || true)" \
+ && NODE_VERSION="${NODE_VERSION:-20}" \
  && nvm install "${NODE_VERSION}" \
  && nvm alias default "${NODE_VERSION}" \
- && node --version && npm --version
+ && echo "Node $(node --version)"
 
-# -----------------------------------------------------------------------------
-# 4b. Dependencies, using the package manager THIS COMMIT expects
+# --- 3. Dependencies: delta only, unless the lockfile actually moved ----------
+# `npm install` is used, NOT `npm ci`: npm ci deletes node_modules before
+# installing, which would throw away exactly what the base image provides. With
+# an unchanged lockfile `npm install` reports "up to date" and costs seconds.
 #
-# microsoft/vscode switched from yarn to npm in commit b5a6aa14a8c5
-# ("feat: switch to npm as default package manager", #226927, 2024-09-06),
-# which deleted yarn.lock and added package-lock.json in the same change
-# (verified: `git log --diff-filter=D -- yarn.lock` and
-#            `git log --diff-filter=A -- package-lock.json` both name it).
-# Detecting the lockfile therefore covers the entire history in two branches,
-# with no version table to maintain.
-# -----------------------------------------------------------------------------
-RUN if [ -f package-lock.json ]; then \
-      echo "npm era (package-lock.json present)"; \
+# If the lockfile HAS changed relative to the base, the delta may be large
+# enough that a clean install is the safer choice, so fall back to npm ci.
+RUN set -e; \
+    if   [ -f package-lock.json ]; then LOCK=package-lock.json; \
+    elif [ -f yarn.lock ];         then LOCK=yarn.lock; \
+    else                                LOCK=""; fi; \
+    if [ -n "$LOCK" ]; then NOW="$(sha1sum "$LOCK" | cut -d' ' -f1)"; else NOW=none; fi; \
+    WAS="$(cat /home/vscodedev/.lockhash 2>/dev/null || echo unknown)"; \
+    echo "lockfile: $LOCK  this=$NOW  base=$WAS"; \
+    if [ "$NOW" = "$WAS" ]; then \
+      echo "Lockfile matches the base image - reconciling only"; \
+      npm install --no-audit --no-fund; \
+    elif [ "$LOCK" = "package-lock.json" ]; then \
+      echo "Lockfile differs from the base image - clean install"; \
       npm ci; \
-    elif [ -f yarn.lock ]; then \
-      echo "yarn era (yarn.lock present)"; \
+    elif [ "$LOCK" = "yarn.lock" ]; then \
+      echo "Lockfile differs from the base image - clean yarn install"; \
       npm install -g yarn; \
       yarn install --frozen-lockfile; \
     else \
-      echo "No lockfile found; falling back to npm install"; \
-      npm install; \
+      npm install --no-audit --no-fund; \
     fi
 
-# Ensure the Electron binary is present in .build/electron. This mirrors
-# .devcontainer/post-create.sh ("npm i && npm run electron"). The script is
-# guarded because very old commits predate it.
-RUN if node -e "process.exit(require('./package.json').scripts.electron?0:1)"; then \
+# Keep the Electron binary in sync with this commit's pinned version. Cheap when
+# it already matches.
+RUN if node -e "process.exit(require('./package.json').scripts.electron ? 0 : 1)"; then \
       npm run electron; \
-    else \
-      echo "No 'electron' script at this commit; relying on the install lifecycle"; \
     fi
 
-# -----------------------------------------------------------------------------
-# 5. Build
+# --- 4. Compile ---------------------------------------------------------------
+# out/ is wiped first: `git checkout` does not remove compiled output belonging
+# to source files that no longer exist at this commit, and a stale file there
+# could change how the editor behaves - which would corrupt a bisect verdict.
+# node_modules and .build/ are kept; they are the expensive parts.
 #
 # `compile` produces the runnable development build that ./scripts/code.sh
-# launches. Deliberately NOT a packaged .deb/.rpm build: VS Code's release
-# pipeline (build/azure-pipelines/linux/setup-env.sh) downloads Chromium
-# sysroots and a pinned clang to produce distributable binaries, and none of
-# that is needed to reproduce a bug.
-# -----------------------------------------------------------------------------
-RUN npm run compile
+# launches. Deliberately not a packaged .deb: the release pipeline downloads
+# Chromium sysroots and a pinned clang, none of which is needed to reproduce a
+# bug.
+RUN rm -rf out out-build \
+ && npm run compile
 
-# -----------------------------------------------------------------------------
-# 6. Launchable environment
-#
-# Starts Xvfb (VS Code's own choice of virtual display: see
-# build/azure-pipelines/linux/xvfb.init) plus x11vnc so the window can be
-# watched and driven on port 5900, then runs VS Code.
-#
-# --no-sandbox          Chromium's sandbox does not work unprivileged in a
-#                       container; VS Code CI relaxes the host kernel instead.
-# --disable-gpu         no GPU is exposed to the container.
-# --disable-dev-shm-usage  /dev/shm defaults to 64 MB in Docker; without this
-#                       (or --shm-size=1g on run) the renderer crashes.
-# -----------------------------------------------------------------------------
-RUN printf '%s\n' \
-  '#!/bin/bash' \
-  'set -e' \
-  'source /etc/profile.d/nvm.sh' \
-  '# NODE_OPTIONS raises the heap for the BUILD; Electron must not inherit it,' \
-  '# mirroring resources/darwin/bin/code.sh.' \
-  'unset NODE_OPTIONS' \
-  'DISPLAY_NUM="${DISPLAY:-:99}"' \
-  'Xvfb "$DISPLAY_NUM" -screen 0 1280x900x24 -ac >/tmp/xvfb.log 2>&1 &' \
-  'sleep 2' \
-  'x11vnc -display "$DISPLAY_NUM" -forever -nopw -shared -rfbport 5900 \' \
-  '        -listen 0.0.0.0 >/tmp/x11vnc.log 2>&1 &' \
-  'cd "$VSCODE_DIR"' \
-  'exec ./scripts/code.sh --no-sandbox --disable-gpu \' \
-  '     --disable-dev-shm-usage --user-data-dir /tmp/vscode-user-data "$@"' \
-  > /home/vscodedev/launch-vscode.sh \
- && chmod +x /home/vscodedev/launch-vscode.sh
+# Record which commit this image is, so one found later is identifiable.
+RUN echo "$COMMIT" > /home/vscodedev/COMMIT
+LABEL vscode.commit="${COMMIT}"
 
-# Record which commit this image is, so an image found later is identifiable.
-RUN echo "$VSCODE_COMMIT" > /home/vscodedev/VSCODE_COMMIT
-LABEL vscode.commit="${VSCODE_COMMIT}"
-
-EXPOSE 5900
-WORKDIR ${VSCODE_DIR}
-CMD ["/home/vscodedev/launch-vscode.sh"]
+EXPOSE 5901 6080
+CMD ["/usr/local/bin/entrypoint.sh"]
